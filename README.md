@@ -19,19 +19,23 @@ Parents have no visibility into these interactions — until now.
 Child's Claude session
         │
         ▼
-┌─────────────────────┐
-│  parental-control   │  ← MCP Server (this project)
-│  ─────────────────  │
-│  classifier.ts      │  ← Keyword + pattern matching
-│  memory.ts          │  ← SQLite conversation history
-│  approval.ts        │  ← Hold-for-approval flow
-│  notifier.ts        │  ← Telegram / iMessage / WhatsApp / Email
-│  profiles.ts        │  ← Age-based restriction profiles
-└─────────────────────┘
+┌──────────────────────────────────────┐
+│  parental-control  (MCP Server)      │
+│  ────────────────────────────────    │
+│  policy.ts         ← YAML policy, hot-reload via chokidar
+│  classifier.ts     ← Regex-first, LLM second-pass
+│  privacy-router.ts ← PII detection, local/cloud routing
+│  audit.ts          ← JSON Lines audit log
+│  session-tracker.ts← Daily limits, curfew enforcement
+│  memory.ts         ← SQLite conversation history
+│  approval.ts       ← Hold-for-approval flow
+│  notifier.ts       ← Telegram / iMessage / WhatsApp / Email
+│  profiles.ts       ← Age-based restriction profiles
+└──────────────────────────────────────┘
         │
         ▼
-  Parent's phone
-(Telegram / iMessage / WhatsApp / Email)
+  Parent's phone                  Local Ollama (optional)
+(Telegram / iMessage / ...)     http://localhost:11434
 ```
 
 The server runs alongside Claude Desktop (or any MCP-compatible agent) and intercepts every message using the `check_message` tool. When something is flagged, the parent gets an alert — and for critical content, the message is held until the parent responds.
@@ -123,6 +127,22 @@ SMTP_PASS=your-app-password
 SMTP_PARENT_EMAIL=you@gmail.com
 ```
 
+### Policy File (recommended)
+
+The easiest way to configure the server is with a YAML policy file at `~/.parental-control/policy.yaml`. Copy the example to get started:
+
+```bash
+cp policy.yaml.example ~/.parental-control/policy.yaml
+```
+
+The server watches this file and hot-reloads it without a restart. You can also force a reload:
+
+```bash
+npx @gonzih/parental-control --reload-policy
+```
+
+See [`policy.yaml.example`](./policy.yaml.example) for all options.
+
 ### All Environment Variables
 
 | Variable | Default | Description |
@@ -146,6 +166,8 @@ SMTP_PARENT_EMAIL=you@gmail.com
 | `PARENTAL_CONTROL_DB` | `~/.parental-control/db.sqlite` | Database file path |
 | `APPROVAL_TIMEOUT_MINUTES` | `30` | Auto-deny timeout for held messages |
 | `SPIRAL_WINDOW_MESSAGES` | `20` | Message history window for spiral detection |
+| `ANTHROPIC_API_KEY` | — | API key for LLM second-pass classification (cloud) |
+| `LOCAL_MODEL` | `llama3.2` | Ollama model name for local LLM classification |
 
 ## MCP Tools
 
@@ -292,12 +314,87 @@ Every alert includes actionable guidance tailored to the category. Examples:
 **For explicit content:**
 > Stay calm — panic may shut down communication. This is an opportunity, not a crisis. Frame it around safety and healthy relationships, not punishment.
 
+## Out-of-Process Enforcement
+
+Classification runs **entirely outside the child model's context**. Even if the child's AI session is jailbroken or manipulated, it cannot influence the safety decision:
+
+1. **First pass — regex + keyword matching** (fast, zero cost, prompt-injection-proof)
+   - Confidence > 0.8 → use result directly, no LLM needed
+   - Confidence 0.4–0.8 → escalate to second pass
+   - Confidence < 0.4 → allow but log
+
+2. **Second pass — LLM classifier** (only for edge cases)
+   - Routed to local Ollama or Anthropic API based on `inference_router` setting
+   - A separate model from the child's conversation model
+
+## Privacy Router
+
+Control where LLM inference happens via `inference_router` in `policy.yaml`:
+
+| Value | Behavior |
+|-------|----------|
+| `local` | All inference → Ollama at `http://localhost:11434` |
+| `cloud` | All inference → Anthropic API |
+| `auto` | PII/sensitive content → local, general → cloud |
+
+PII detection (regex-based, never LLM-based) catches:
+- Social Security numbers (`XXX-XX-XXXX`)
+- Credit card numbers
+- Phone numbers
+- Email addresses
+- Street addresses
+
+## Audit Log
+
+Every classification decision is written to `~/.parental-control/audit.log` in JSON Lines format:
+
+```json
+{"ts":"2026-03-21T10:00:00Z","category":"violence","action":"block","content_snippet":"first 100 chars...","tool":"check_message","session_id":"abc123"}
+```
+
+Generate a daily summary:
+
+```bash
+npx @gonzih/parental-control --audit-report
+# or for a specific date:
+npx @gonzih/parental-control --audit-report 2026-03-20
+```
+
+Output:
+```
+=== Audit Report for 2026-03-21 ===
+
+Total events: 47
+
+Actions:
+  allow: 40
+  notify: 4
+  block: 2
+  hold_for_approval: 1
+
+Categories:
+  safe: 40
+  spiral_detected: 4
+  violence: 2
+  self_harm: 1
+```
+
+## Session Time Limits
+
+Track daily usage in `~/.parental-control/usage.json`. When the daily limit is reached, all tool calls are blocked and the parent receives a notification:
+
+> "Daily limit reached: Alex has used 120 minutes today."
+
+Curfew hours are also enforced — no AI access between `curfew_start` and `curfew_end` (supports overnight curfews like 21:00–08:00).
+
 ## Privacy & Data
 
 - All conversation history is stored locally in SQLite (`~/.parental-control/db.sqlite`)
+- Audit log at `~/.parental-control/audit.log` (JSON Lines, parent-readable)
+- Usage tracking at `~/.parental-control/usage.json`
 - No data is sent to any third-party service except your chosen notification channel
 - The database path is configurable via `PARENTAL_CONTROL_DB`
-- Classification is done entirely on-device using keyword matching and regex patterns
+- With `inference_router: local`, all AI classification stays on-device via Ollama
 
 ## Development
 
@@ -313,23 +410,30 @@ npm start
 
 ```
 src/
-  index.ts        — MCP server entry point, tool handlers
-  classifier.ts   — Content classification engine
-  keywords.ts     — Keyword lists and regex patterns
-  guidance.ts     — Parent guidance templates
-  profiles.ts     — Child profile management
-  memory.ts       — SQLite persistence layer
-  notifier.ts     — Notification dispatch (Telegram/iMessage/WhatsApp/email)
-  approval.ts     — Hold-for-approval state machine
+  index.ts            — MCP server entry point, CLI flags, tool handlers
+  policy.ts           — YAML policy loader with chokidar file watcher
+  classifier.ts       — Two-pass: regex-first, LLM second-pass with confidence tiers
+  privacy-router.ts   — PII detection (regex), local/cloud inference routing
+  audit.ts            — JSON Lines audit log, daily report generator
+  session-tracker.ts  — Daily usage tracking, curfew enforcement
+  keywords.ts         — Keyword lists and regex patterns
+  guidance.ts         — Parent guidance templates
+  profiles.ts         — Age-based restriction profiles
+  memory.ts           — SQLite persistence layer
+  notifier.ts         — Notification dispatch (Telegram/iMessage/WhatsApp/email)
+  approval.ts         — Hold-for-approval state machine
+policy.yaml.example   — Annotated policy file template
 ```
 
 ### Adding New Categories
 
 1. Add keywords to `src/keywords.ts`
-2. Add a `Category` type in `src/classifier.ts`
-3. Add classification logic in `classifyContent()`
-4. Add guidance template in `src/guidance.ts`
-5. Update default profiles in `src/profiles.ts`
+2. Add the category to the `Category` union in `src/classifier.ts`
+3. Add classification logic in `classifyWithRegex()`
+4. Add a `categoryToDecision()` mapping entry
+5. Add a guidance template in `src/guidance.ts`
+6. Update default profiles in `src/profiles.ts`
+7. Add the category key to `policy.yaml.example`
 
 ## Contributing
 

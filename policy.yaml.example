@@ -1,0 +1,41 @@
+version: 1
+
+child:
+  name: "Alex"
+  age_group: "under-13"  # under-13 | teen-13-17 | adult
+
+# Actions per content category: block | notify | hold_for_approval | allow
+content_rules:
+  violence: block
+  adult: block
+  profanity: notify
+  spiral_detected: hold_for_approval
+  echo_chamber: notify
+  sycophancy_amplification: notify
+  self_harm: block
+  substance_abuse: block
+  pii_extraction: block
+  suicide: hold_for_approval
+  explicit_sexual: block
+  extremist_content: block
+  gambling: notify
+  age_restricted: notify
+
+time_limits:
+  daily_minutes: 120       # Total AI usage allowed per day
+  sessions_per_day: 3      # Max number of sessions per day
+  curfew_start: "21:00"    # No AI access after this time (24h format)
+  curfew_end: "08:00"      # AI access resumes at this time
+
+notifications:
+  telegram_chat_id: ""     # Your Telegram chat ID (from @userinfobot)
+  telegram_bot_token: ""   # Bot token from @BotFather (overrides env var)
+  email: ""                # Fallback notification email
+
+approval_timeout_minutes: 30  # Auto-deny held messages after this many minutes
+
+# Inference routing for LLM-based second-pass classification
+# local  — all inference to http://localhost:11434 (Ollama) — maximum privacy
+# cloud  — all inference to Anthropic API (requires ANTHROPIC_API_KEY)
+# auto   — PII/sensitive content → local, general questions → cloud
+inference_router: cloud
