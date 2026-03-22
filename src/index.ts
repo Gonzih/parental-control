@@ -13,9 +13,37 @@ import { holdForApproval, handleApprovalDecision, getSafeDeflection, listPending
 import { getOrCreateDefaultProfile, getProfile, setProfile } from './profiles.js';
 import type { ChildProfile } from './profiles.js';
 import { pollTelegramUpdates } from './notifier.js';
+import { loadPolicy, getPolicy, watchPolicy } from './policy.js';
+import { logAuditEvent, generateDailyReport } from './audit.js';
+import { checkSessionAllowed, recordActivity, getUsageSummary } from './session-tracker.js';
+import { detectPii } from './privacy-router.js';
+import { randomUUID } from 'crypto';
+
+// --- CLI flag handling ---
+const cliArgs = process.argv.slice(2);
+
+if (cliArgs.includes('--audit-report')) {
+  const date = cliArgs[cliArgs.indexOf('--audit-report') + 1];
+  const validDate = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : undefined;
+  console.log(generateDailyReport(validDate));
+  process.exit(0);
+}
+
+if (cliArgs.includes('--reload-policy')) {
+  loadPolicy();
+  console.log('[policy] Policy reloaded from disk.');
+  process.exit(0);
+}
+
+// --- Startup: load policy, start file watcher ---
+loadPolicy();
+watchPolicy();
+
+// --- Session ID for audit log ---
+const SESSION_ID = randomUUID().slice(0, 8);
 
 const server = new Server(
-  { name: 'parental-control', version: '0.1.0' },
+  { name: 'parental-control', version: '0.2.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -105,40 +133,103 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { content, role, profileId } = args as {
           content: string; role: string; profileId?: string;
         };
-        const profile = profileId ? (getProfile(profileId) ?? getOrCreateDefaultProfile()) : getOrCreateDefaultProfile();
 
+        // Session limit check
+        const sessionStatus = checkSessionAllowed();
+        if (!sessionStatus.allowed) {
+          logAuditEvent({
+            ts: new Date().toISOString(),
+            category: 'session_limit',
+            action: 'block',
+            content_snippet: content.slice(0, 100),
+            tool: 'check_message',
+            session_id: SESSION_ID,
+          });
+          const policy = getPolicy();
+          // Notify parent if daily limit hit
+          if (sessionStatus.reason?.includes('Daily limit')) {
+            const profile = profileId ? (getProfile(profileId) ?? getOrCreateDefaultProfile()) : getOrCreateDefaultProfile();
+            sendNotification({
+              profile,
+              result: {
+                decision: 'block',
+                category: 'safe',
+                confidence: 1.0,
+                reason: sessionStatus.reason,
+              },
+              content: sessionStatus.reason,
+              role: 'system',
+            }).catch(console.error);
+            // Also check telegram from policy
+            if (!profile.parentContact && policy.notifications.telegram_chat_id) {
+              console.error(`[session] Notify parent (telegram): ${sessionStatus.reason}`);
+            }
+          }
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({ decision: 'block', reason: sessionStatus.reason }),
+            }],
+          };
+        }
+
+        recordActivity();
+
+        const profile = profileId ? (getProfile(profileId) ?? getOrCreateDefaultProfile()) : getOrCreateDefaultProfile();
         const recent = getRecentMessages(profile.id, parseInt(process.env.SPIRAL_WINDOW_MESSAGES ?? '20', 10));
         const spiralScore = computeSpiralScore(recent);
 
-        const result = classifyContent(content, {
+        // Two-pass classification: regex first, LLM only for edge cases
+        const result = await classifyContent(content, {
           recentMessages: recent,
           spiralScore,
         });
 
+        // PII check: runs independently of classifier (regex-only, never LLM)
+        const piiResult = detectPii(content);
+        if (piiResult.hasPii && result.category === 'safe') {
+          result.category = 'pii_extraction';
+          result.decision = 'block';
+          result.reason = `PII detected: ${piiResult.types.join(', ')}`;
+        }
+
         // Log the message
         logMessage(profile.id, role, content, result.decision !== 'allow', result.category !== 'safe' ? result.category : undefined);
 
-        // Handle based on profile restrictions
-        const { restrictions } = profile;
-        let finalDecision = result.decision;
-
-        if (restrictions.blockedCategories.includes(result.category as Category)) {
-          finalDecision = 'block';
-        } else if (restrictions.holdCategories.includes(result.category as Category)) {
-          finalDecision = 'hold_for_approval';
-        } else if (restrictions.notifyCategories.includes(result.category as Category)) {
-          finalDecision = 'notify';
+        // Apply policy content_rules (overrides age-based profile defaults)
+        const policy = getPolicy();
+        const policyAction = policy.content_rules[result.category];
+        if (policyAction) {
+          result.decision = policyAction;
+        } else {
+          // Fall back to profile-based restrictions
+          const { restrictions } = profile;
+          if (restrictions.blockedCategories.includes(result.category as Category)) {
+            result.decision = 'block';
+          } else if (restrictions.holdCategories.includes(result.category as Category)) {
+            result.decision = 'hold_for_approval';
+          } else if (restrictions.notifyCategories.includes(result.category as Category)) {
+            result.decision = 'notify';
+          }
         }
 
-        result.decision = finalDecision;
+        // Write to audit log
+        logAuditEvent({
+          ts: new Date().toISOString(),
+          category: result.category,
+          action: result.decision,
+          content_snippet: content.slice(0, 100),
+          tool: 'check_message',
+          session_id: SESSION_ID,
+        });
 
-        // Send notification if needed
-        if (finalDecision === 'notify') {
+        // Send notification
+        if (result.decision === 'notify') {
           sendNotification({ profile, result, content, role }).catch(console.error);
         }
 
         // Hold for approval
-        if (finalDecision === 'hold_for_approval') {
+        if (result.decision === 'hold_for_approval') {
           const { approved, note } = await holdForApproval(profile, result, content, role);
           return {
             content: [{
@@ -174,7 +265,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         const resolved = handleApprovalDecision(approvalId, decision, parentNote);
         if (!resolved) {
-          // Try DB-level resolution (for already-stored but not in-memory)
           dbResolveApproval(approvalId, decision, parentNote);
         }
         return { content: [{ type: 'text', text: JSON.stringify({ resolved: true }) }] };
@@ -198,6 +288,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { profileId } = (args ?? {}) as { profileId?: string };
         const profile = profileId ? (getProfile(profileId) ?? getOrCreateDefaultProfile()) : getOrCreateDefaultProfile();
         const analysis = analyzeSpiralRisk(profile.id);
+        const usage = getUsageSummary();
         return {
           content: [{
             type: 'text',
@@ -208,6 +299,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               flags: analysis.flags,
               spiralIndicators: analysis.topTopics,
               messageCount: analysis.recentMessages.length,
+              sessionUsage: usage,
             }),
           }],
         };
@@ -229,7 +321,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // Start Telegram polling in background if configured
-if (process.env.TELEGRAM_BOT_TOKEN) {
+const telegramToken = process.env.TELEGRAM_BOT_TOKEN ?? getPolicy().notifications.telegram_bot_token;
+if (telegramToken) {
+  if (!process.env.TELEGRAM_BOT_TOKEN) process.env.TELEGRAM_BOT_TOKEN = telegramToken;
   pollTelegramUpdates(
     async (id) => { handleApprovalDecision(id, 'approve'); },
     async (id) => { handleApprovalDecision(id, 'deny'); }
