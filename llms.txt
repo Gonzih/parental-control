@@ -1,0 +1,121 @@
+# parental-control
+
+An open-source MCP (Model Context Protocol) proxy server that gives parents real-time oversight of children's AI agent interactions.
+
+## What it does
+
+- **Content classification**: Keyword + pattern matching for dangerous/inappropriate content
+- **Spiral detection**: Stateful analysis of conversation history to detect negative thought spirals, echo chambers, and sycophantic amplification
+- **Parent notifications**: Alerts via Telegram, iMessage (macOS), WhatsApp (Twilio), or email
+- **Approval flows**: Holds borderline messages for parent approval with timeout fallback
+- **Parent guidance**: Actionable coaching on how to approach difficult conversations with your child
+
+## Installation
+
+```bash
+npx @gonzih/parental-control
+```
+
+Or in Claude Desktop `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "parental-control": {
+      "command": "npx",
+      "args": ["-y", "@gonzih/parental-control"],
+      "env": {
+        "PARENTAL_CONTROL_CHILD_NAME": "Alex",
+        "PARENTAL_CONTROL_CHILD_AGE": "14",
+        "TELEGRAM_BOT_TOKEN": "...",
+        "TELEGRAM_PARENT_CHAT_ID": "..."
+      }
+    }
+  }
+}
+```
+
+## MCP Tools
+
+### check_message
+Classify a message before it reaches or comes from the child.
+- Input: `content` (string), `role` ("user"|"assistant"), `profileId` (optional)
+- Output: `{ decision, category, confidence, reason, held?, approved?, safeDeflection? }`
+
+### log_interaction
+Log an interaction to conversation history for pattern analysis.
+- Input: `role`, `content`, `profileId` (optional)
+- Output: `{ logged: true }`
+
+### resolve_approval
+Approve or deny a held message (also via Telegram bot commands).
+- Input: `approvalId`, `decision` ("approve"|"deny"), `parentNote` (optional)
+- Output: `{ resolved: true }`
+
+### list_pending
+List messages currently held for parent approval.
+- Input: `profileId` (optional filter)
+- Output: Array of pending approvals
+
+### update_profile
+Update child profile settings.
+- Input: `profileId`, `settings` (partial ChildProfile)
+- Output: Updated profile
+
+### get_risk_summary
+Get spiral risk score and conversation flags.
+- Input: `profileId` (optional)
+- Output: `{ riskScore, flags, spiralIndicators, messageCount }`
+
+## Decisions
+
+| Decision | Meaning |
+|----------|---------|
+| `allow` | Safe to forward |
+| `notify` | Safe but parent gets an alert |
+| `block` | Stopped entirely |
+| `hold_for_approval` | Held until parent approves/denies |
+
+## Categories
+
+- `safe` — No issues
+- `self_harm` — Self-harm content
+- `suicide` — Suicidal ideation
+- `explicit_sexual` — Sexual content
+- `violence` — Violence instructions
+- `substance_abuse` — Drug/alcohol content
+- `age_restricted` — Age-restricted content
+- `gambling` — Gambling content
+- `extremist_content` — Extremist/radicalization
+- `spiral_detected` — Negative thought spiral
+- `echo_chamber` — AI reinforcing extreme beliefs
+- `sycophantic_amplification` — AI amplifying negative emotions
+- `emotional_manipulation` — Manipulative content
+- `identity_crisis` — Identity struggle signals
+- `minor_inappropriate` — Mildly inappropriate
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `PARENTAL_CONTROL_CHILD_NAME` | Child's name |
+| `PARENTAL_CONTROL_CHILD_AGE` | Child's age (determines default restrictions) |
+| `PARENTAL_CONTROL_PROFILE_ID` | Profile ID (default: "default") |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token |
+| `TELEGRAM_PARENT_CHAT_ID` | Parent's Telegram chat ID |
+| `IMESSAGE_PARENT_PHONE` | Parent's phone for iMessage (macOS only) |
+| `TWILIO_ACCOUNT_SID` | Twilio account SID (WhatsApp) |
+| `TWILIO_AUTH_TOKEN` | Twilio auth token |
+| `TWILIO_WHATSAPP_FROM` | Twilio WhatsApp sender number |
+| `SMTP_HOST` | Email SMTP host |
+| `SMTP_PORT` | Email SMTP port |
+| `SMTP_USER` | Email SMTP username |
+| `SMTP_PASS` | Email SMTP password |
+| `SMTP_PARENT_EMAIL` | Parent's email address |
+| `PARENTAL_CONTROL_DB` | SQLite database path (default: ~/.parental-control/db.sqlite) |
+| `APPROVAL_TIMEOUT_MINUTES` | Minutes to wait for approval (default: 30) |
+| `SPIRAL_WINDOW_MESSAGES` | Messages to analyze for spiral detection (default: 20) |
+
+## Telegram Bot Commands
+
+- `/approve <id>` — Approve a held message
+- `/deny <id>` — Deny a held message
